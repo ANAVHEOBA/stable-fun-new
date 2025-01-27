@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn test_percentage_calculation() {
-        let amount = 1_000_000;
+        let amount: u64 = 1_000_000;
         let basis_points = 500; // 5%
 
         let result = common::calculate_percentage(amount, basis_points).unwrap();

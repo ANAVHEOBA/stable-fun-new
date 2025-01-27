@@ -1,18 +1,12 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount};
-use switchboard_solana::{
-    AggregatorAccountData,
-    SWITCHBOARD_PROGRAM_ID,
-};
+use anchor_spl::token::{self, Token, TokenAccount, Mint};
+use switchboard_solana::AggregatorAccountData;
 
 use crate::state::{StablecoinMint, StablecoinVault};
-use crate::error::*;
-use super::{
-    verify_oracle_price,
-    calculate_token_amount,
-    validate_collateral_ratio,
-    transfer_tokens,
-};
+use crate::error::StableFunError;
+use crate::utils::oracle::OracleService;
+use crate::utils::validation::ValidationService;
+use crate::utils::math;
 
 #[derive(Accounts)]
 #[instruction(amount: u64)]
@@ -22,45 +16,45 @@ pub struct MintStablecoin<'info> {
 
     #[account(
         mut,
-        constraint = stablecoin_mint.authority == user.key() @ StablecoinError::UnauthorizedMint
+        constraint = stablecoin_mint.authority == user.key() @ StableFunError::UnauthorizedMint
     )]
     pub stablecoin_mint: Account<'info, StablecoinMint>,
 
     #[account(
         mut,
-        constraint = vault.stablecoin_mint == stablecoin_mint.key() @ StablecoinError::InvalidVault
+        constraint = vault.stablecoin_mint == stablecoin_mint.key() @ StableFunError::InvalidVault
     )]
     pub vault: Account<'info, StablecoinVault>,
 
     #[account(
         mut,
-        constraint = token_mint.key() == stablecoin_mint.token_mint @ StablecoinError::InvalidMint
+        constraint = token_mint.key() == stablecoin_mint.token_mint @ StableFunError::InvalidMint
     )]
-    pub token_mint: Account<'info, Mint>,
+    pub token_mint: Box<Account<'info, token::Mint>>,
 
     #[account(
         mut,
-        constraint = user_token_account.mint == token_mint.key() @ StablecoinError::InvalidTokenAccount,
-        constraint = user_token_account.owner == user.key() @ StablecoinError::InvalidTokenAccount
+        constraint = user_token_account.mint == token_mint.key() @ StableFunError::InvalidTokenAccount,
+        constraint = user_token_account.owner == user.key() @ StableFunError::InvalidTokenAccount
     )]
-    pub user_token_account: Account<'info, TokenAccount>,
+    pub user_token_account: Box<Account<'info, TokenAccount>>,
 
     #[account(
         mut,
-        constraint = user_stablebond_account.mint == stablecoin_mint.stablebond_mint @ StablecoinError::InvalidStablebond,
-        constraint = user_stablebond_account.owner == user.key() @ StablecoinError::InvalidStablebond
+        constraint = user_stablebond_account.mint == stablecoin_mint.stablebond_mint @ StableFunError::InvalidStablebond,
+        constraint = user_stablebond_account.owner == user.key() @ StableFunError::InvalidStablebond
     )]
-    pub user_stablebond_account: Account<'info, TokenAccount>,
+    pub user_stablebond_account: Box<Account<'info, TokenAccount>>,
 
     #[account(
         mut,
-        constraint = vault_stablebond_account.key() == vault.collateral_account @ StablecoinError::InvalidVaultAccount
+        constraint = vault_stablebond_account.key() == vault.collateral_account @ StableFunError::InvalidVaultAccount
     )]
-    pub vault_stablebond_account: Account<'info, TokenAccount>,
+    pub vault_stablebond_account: Box<Account<'info, TokenAccount>>,
 
     /// The Switchboard V3 aggregator account
     #[account(
-        constraint = price_feed.key() == stablecoin_mint.price_feed @ StablecoinError::InvalidOracle
+        constraint = price_feed.key() == stablecoin_mint.price_feed @ StableFunError::InvalidOracle
     )]
     pub price_feed: AccountLoader<'info, AggregatorAccountData>,
 
@@ -80,20 +74,20 @@ pub fn handler(ctx: Context<MintStablecoin>, amount: u64) -> Result<()> {
     let vault = &mut ctx.accounts.vault;
 
     // Validate mint is not paused
-    require!(!stablecoin_mint.settings.mint_paused, StablecoinError::MintPaused);
+    require!(!stablecoin_mint.settings.mint_paused, StableFunError::MintingPaused);
 
     // Validate amount
-    require!(amount > 0, StablecoinError::InvalidAmount);
+    require!(amount > 0, StableFunError::InvalidAmount);
     require!(
         stablecoin_mint.current_supply.checked_add(amount).unwrap() <= stablecoin_mint.settings.max_supply,
-        StablecoinError::MaxSupplyExceeded
+        StableFunError::MaxSupplyExceeded
     );
 
-    // Get oracle price using v3 price feed
-    let oracle_price = verify_oracle_price(&ctx.accounts.price_feed)?;
+    // Get oracle price
+    let oracle_price = OracleService::verify_oracle_price(&ctx.accounts.price_feed)?;
 
     // Calculate required collateral amount
-    let collateral_amount = calculate_token_amount(
+    let collateral_amount = math::calculate_token_amount(
         amount,
         oracle_price,
         ctx.accounts.token_mint.decimals,
@@ -103,16 +97,22 @@ pub fn handler(ctx: Context<MintStablecoin>, amount: u64) -> Result<()> {
     let fee_amount = amount
         .checked_mul(stablecoin_mint.settings.fee_basis_points as u64)
         .and_then(|v| v.checked_div(10000))
-        .ok_or(StablecoinError::MathOverflow)?;
+        .ok_or(error!(StableFunError::MathOverflow))?;
 
-    let total_amount = amount.checked_add(fee_amount).ok_or(StablecoinError::MathOverflow)?;
+    let total_amount = amount
+        .checked_add(fee_amount)
+        .ok_or(error!(StableFunError::MathOverflow))?;
 
     // Transfer stablebonds to vault
-    transfer_tokens(
-        &ctx.accounts.user_stablebond_account,
-        &ctx.accounts.vault_stablebond_account,
-        &ctx.accounts.user,
-        &ctx.accounts.token_program,
+    token::transfer(
+        CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            token::Transfer {
+                from: ctx.accounts.user_stablebond_account.to_account_info(),
+                to: ctx.accounts.vault_stablebond_account.to_account_info(),
+                authority: ctx.accounts.user.to_account_info(),
+            },
+        ),
         collateral_amount,
     )?;
 
@@ -135,30 +135,45 @@ pub fn handler(ctx: Context<MintStablecoin>, amount: u64) -> Result<()> {
     )?;
 
     // Update vault state
-    vault.total_collateral = vault.total_collateral.checked_add(collateral_amount).unwrap();
+    vault.total_collateral = vault
+        .total_collateral
+        .checked_add(collateral_amount)
+        .ok_or(error!(StableFunError::MathOverflow))?;
+    
     vault.total_value_locked = vault
         .total_value_locked
         .checked_add(amount)
-        .ok_or(StablecoinError::MathOverflow)?;
-    vault.deposit_count = vault.deposit_count.checked_add(1).unwrap();
+        .ok_or(error!(StableFunError::MathOverflow))?;
+    
+    vault.deposit_count = vault
+        .deposit_count
+        .checked_add(1)
+        .ok_or(error!(StableFunError::MathOverflow))?;
+    
     vault.last_deposit_time = Clock::get()?.unix_timestamp;
-    vault.update_collateral_ratio()?;
+    
+    // Update collateral ratio
+    ValidationService::update_collateral_ratio(vault)?;
 
     // Update stablecoin state
     stablecoin_mint.current_supply = stablecoin_mint
         .current_supply
         .checked_add(total_amount)
-        .ok_or(StablecoinError::MathOverflow)?;
+        .ok_or(error!(StableFunError::MathOverflow))?;
+    
     stablecoin_mint.stats.total_minted = stablecoin_mint
         .stats
         .total_minted
         .checked_add(amount)
-        .ok_or(StablecoinError::MathOverflow)?;
+        .ok_or(error!(StableFunError::MathOverflow))?;
+    
     stablecoin_mint.stats.total_fees = stablecoin_mint
         .stats
         .total_fees
         .checked_add(fee_amount)
-        .ok_or(StablecoinError::MathOverflow)?;
+        .ok_or(error!(StableFunError::MathOverflow))?;
+
+    stablecoin_mint.last_updated = Clock::get()?.unix_timestamp;
 
     emit!(MintEvent {
         stablecoin_mint: stablecoin_mint.key(),
@@ -182,38 +197,30 @@ pub struct MintEvent {
     pub timestamp: i64,
 }
 
-#[error_code]
-pub enum StablecoinError {
-    #[msg("Unauthorized mint attempt")]
-    UnauthorizedMint,
-    #[msg("Invalid vault account")]
-    InvalidVault,
-    #[msg("Invalid mint account")]
-    InvalidMint,
-    #[msg("Invalid token account")]
-    InvalidTokenAccount,
-    #[msg("Invalid stablebond account")]
-    InvalidStablebond,
-    #[msg("Invalid vault token account")]
-    InvalidVaultAccount,
-    #[msg("Invalid oracle account")]
-    InvalidOracle,
-    #[msg("Invalid amount")]
-    InvalidAmount,
-    #[msg("Math overflow")]
-    MathOverflow,
-    #[msg("Mint is paused")]
-    MintPaused,
-    #[msg("Max supply exceeded")]
-    MaxSupplyExceeded,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anchor_lang::solana_program::system_program;
 
     #[test]
-    fn test_mint_validation() {
-        // Add tests here
+    fn test_fee_calculation() {
+        let fee_basis_points = 30; // 0.3%
+        let amount: u64 = 1_000_000;
+        
+        let fee = amount
+            .checked_mul(fee_basis_points as u64)
+            .and_then(|v| v.checked_div(10000))
+            .unwrap();
+            
+        assert_eq!(fee, 3_000);
+    }
+
+    #[test]
+    fn test_total_amount_calculation() {
+        let amount: u64 = 1_000_000;
+        let fee = 3_000;
+        
+        let total = amount.checked_add(fee).unwrap();
+        assert_eq!(total, 1_003_000);
     }
 }

@@ -54,6 +54,23 @@ impl ValidationService {
     }
 
     #[inline(always)]
+    pub fn update_collateral_ratio(vault: &mut Account<StablecoinVault>) -> Result<()> {
+        if vault.total_value_locked == 0 || vault.total_collateral == 0 {
+            vault.current_ratio = 0;
+            return Ok(());
+        }
+
+        let ratio = (vault.total_value_locked as u128)
+            .checked_mul(10000)
+            .and_then(|v| v.checked_div(vault.total_collateral as u128))
+            .map(|v| v as u16)
+            .ok_or(error!(StableFunError::MathOverflow))?;
+
+        vault.current_ratio = ratio;
+        Ok(())
+    }
+
+    #[inline(always)]
     pub fn validate_fee(fee_bps: u16) -> Result<()> {
         require!(fee_bps <= MAX_FEE_BPS, StableFunError::FeeTooHigh);
         Ok(())
@@ -130,7 +147,6 @@ impl ValidationService {
 
         require!(oracle_price.value > 0, StableFunError::InvalidOraclePrice);
 
-        // Validate collateral ratio for new supply
         Self::validate_collateral_ratio(
             current_collateral,
             new_supply,
@@ -156,13 +172,11 @@ impl ValidationService {
             StableFunError::InsufficientBalance
         );
 
-        // Calculate new supply after redemption
         let new_supply = stablecoin_mint
             .current_supply
             .checked_sub(amount)
             .ok_or(error!(StableFunError::MathOverflow))?;
 
-        // Validate collateral ratio after redemption
         Self::validate_collateral_ratio(
             remaining_collateral,
             new_supply,

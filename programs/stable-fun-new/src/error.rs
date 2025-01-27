@@ -88,6 +88,9 @@ pub enum StableFunError {
 
     #[msg("Invalid max supply")]
     InvalidMaxSupply,
+
+    #[msg("Unauthorized mint operation")]
+    UnauthorizedMint,
 }
 
 // Helper functions for common error checks

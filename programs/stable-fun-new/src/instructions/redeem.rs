@@ -1,15 +1,12 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self as token_program, Mint, Token, TokenAccount};
-use switchboard_solana::{
-    AggregatorAccountData,
-    SWITCHBOARD_PROGRAM_ID,
-};
+use anchor_spl::token::{self, Token, TokenAccount};
+use switchboard_solana::AggregatorAccountData;
 
 use crate::state::{StablecoinMint, StablecoinVault};
 use crate::error::StableFunError;
-use crate::utils::{self, validation::ValidationService, math};
 use crate::utils::oracle::OracleService;
-use crate::utils::token::transfer_tokens;
+use crate::utils::validation::ValidationService;
+use crate::utils::math;
 
 #[derive(Accounts)]
 #[instruction(amount: u64)]
@@ -22,6 +19,8 @@ pub struct RedeemStablecoin<'info> {
 
     #[account(
         mut,
+        seeds = [b"vault", stablecoin_mint.key().as_ref()],
+        bump,
         constraint = vault.stablecoin_mint == stablecoin_mint.key() @ StableFunError::InvalidVault
     )]
     pub vault: Account<'info, StablecoinVault>,
@@ -30,27 +29,27 @@ pub struct RedeemStablecoin<'info> {
         mut,
         constraint = token_mint.key() == stablecoin_mint.token_mint @ StableFunError::InvalidMint
     )]
-    pub token_mint: Account<'info, Mint>,
+    pub token_mint: Box<Account<'info, token::Mint>>,
 
     #[account(
         mut,
         constraint = user_token_account.mint == token_mint.key() @ StableFunError::InvalidTokenAccount,
         constraint = user_token_account.owner == user.key() @ StableFunError::InvalidTokenAccount
     )]
-    pub user_token_account: Account<'info, TokenAccount>,
+    pub user_token_account: Box<Account<'info, TokenAccount>>,
 
     #[account(
         mut,
         constraint = user_stablebond_account.mint == stablecoin_mint.stablebond_mint @ StableFunError::InvalidStablebond,
         constraint = user_stablebond_account.owner == user.key() @ StableFunError::InvalidStablebond
     )]
-    pub user_stablebond_account: Account<'info, TokenAccount>,
+    pub user_stablebond_account: Box<Account<'info, TokenAccount>>,
 
     #[account(
         mut,
         constraint = vault_stablebond_account.key() == vault.collateral_account @ StableFunError::InvalidVaultAccount
     )]
-    pub vault_stablebond_account: Account<'info, TokenAccount>,
+    pub vault_stablebond_account: Box<Account<'info, TokenAccount>>,
 
     /// The Switchboard V3 aggregator account
     #[account(
@@ -71,18 +70,18 @@ pub struct RedeemStablecoin<'info> {
 
 #[inline(never)]
 pub fn handler(ctx: Context<RedeemStablecoin>, amount: u64) -> Result<()> {
-    let stablecoin_mint = &mut ctx.accounts.stablecoin_mint;
-    let vault = &mut ctx.accounts.vault;
-
     // Initial validations
-    require!(!stablecoin_mint.settings.redeem_paused, StableFunError::RedeemingPaused);
+    require!(!ctx.accounts.stablecoin_mint.settings.redeem_paused, StableFunError::RedeemingPaused);
     require!(amount > 0, StableFunError::InvalidAmount);
     require!(
         amount <= ctx.accounts.user_token_account.amount,
         StableFunError::InsufficientBalance
     );
 
-    // Get oracle price using the OracleService
+    // Validate amount is within bounds
+    ValidationService::validate_amount(amount)?;
+
+    // Get oracle price
     let oracle_price = OracleService::verify_oracle_price(&ctx.accounts.price_feed)?;
 
     // Calculate collateral amount
@@ -94,7 +93,7 @@ pub fn handler(ctx: Context<RedeemStablecoin>, amount: u64) -> Result<()> {
 
     // Calculate fee
     let fee_amount = amount
-        .checked_mul(stablecoin_mint.settings.fee_basis_points as u64)
+        .checked_mul(ctx.accounts.stablecoin_mint.settings.fee_basis_points as u64)
         .and_then(|v| v.checked_div(10000))
         .ok_or(error!(StableFunError::MathOverflow))?;
 
@@ -103,69 +102,93 @@ pub fn handler(ctx: Context<RedeemStablecoin>, amount: u64) -> Result<()> {
         .ok_or(error!(StableFunError::MathOverflow))?;
 
     // Calculate remaining amounts
-    let remaining_collateral = vault
+    let remaining_collateral = ctx.accounts.vault
         .total_collateral
         .checked_sub(collateral_amount)
         .ok_or(error!(StableFunError::MathOverflow))?;
 
-    let remaining_supply = stablecoin_mint
+    let remaining_supply = ctx.accounts.stablecoin_mint
         .current_supply
         .checked_sub(burn_amount)
         .ok_or(error!(StableFunError::MathOverflow))?;
 
-    // Validate collateral ratio
+    // Validate collateral ratio if there's remaining supply
     if remaining_supply > 0 {
         ValidationService::validate_collateral_ratio(
             remaining_collateral,
             remaining_supply,
-            stablecoin_mint.settings.min_collateral_ratio,
+            ctx.accounts.stablecoin_mint.settings.min_collateral_ratio,
         )?;
     }
 
-    // Execute token operations
-    token_program::burn(
+    // Burn stablecoins
+    token::burn(
         CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
-            token_program::Burn {
+            token::Burn {
                 mint: ctx.accounts.token_mint.to_account_info(),
                 from: ctx.accounts.user_token_account.to_account_info(),
                 authority: ctx.accounts.burn_authority.to_account_info(),
             },
             &[&[
                 b"mint-authority",
-                stablecoin_mint.key().as_ref(),
+                ctx.accounts.stablecoin_mint.key().as_ref(),
                 &[ctx.bumps.burn_authority],
             ]],
         ),
         burn_amount,
     )?;
 
-    // Transfer collateral
-    transfer_tokens(
-        &ctx.accounts.vault_stablebond_account,
-        &ctx.accounts.user_stablebond_account,
-        &ctx.accounts.user,
-        &ctx.accounts.token_program,
+    // Transfer collateral back to user
+    token::transfer(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            token::Transfer {
+                from: ctx.accounts.vault_stablebond_account.to_account_info(),
+                to: ctx.accounts.user_stablebond_account.to_account_info(),
+                authority: ctx.accounts.vault.to_account_info(),
+            },
+            &[&[
+                b"vault",
+                ctx.accounts.stablecoin_mint.key().as_ref(),
+                &[ctx.bumps.vault],
+            ]],
+        ),
         collateral_amount,
     )?;
 
     // Update vault state
-    vault.total_collateral = remaining_collateral;
-    vault.total_value_locked = vault
+    ctx.accounts.vault.total_collateral = remaining_collateral;
+    ctx.accounts.vault.total_value_locked = ctx.accounts.vault
         .total_value_locked
         .checked_sub(amount)
         .ok_or(error!(StableFunError::MathOverflow))?;
-    vault.withdrawal_count += 1;
-    vault.last_withdrawal_time = Clock::get()?.unix_timestamp;
-    vault.update_collateral_ratio()?;
+    
+    ctx.accounts.vault.withdrawal_count = ctx.accounts.vault
+        .withdrawal_count
+        .checked_add(1)
+        .ok_or(error!(StableFunError::MathOverflow))?;
+    
+    ctx.accounts.vault.last_withdrawal_time = Clock::get()?.unix_timestamp;
 
     // Update stablecoin state
-    stablecoin_mint.current_supply = remaining_supply;
-    stablecoin_mint.stats.total_burned += amount;
-    stablecoin_mint.stats.total_fees += fee_amount;
+    ctx.accounts.stablecoin_mint.current_supply = remaining_supply;
+    ctx.accounts.stablecoin_mint.stats.total_burned = ctx.accounts.stablecoin_mint
+        .stats
+        .total_burned
+        .checked_add(amount)
+        .ok_or(error!(StableFunError::MathOverflow))?;
+    
+    ctx.accounts.stablecoin_mint.stats.total_fees = ctx.accounts.stablecoin_mint
+        .stats
+        .total_fees
+        .checked_add(fee_amount)
+        .ok_or(error!(StableFunError::MathOverflow))?;
+    
+    ctx.accounts.stablecoin_mint.last_updated = Clock::get()?.unix_timestamp;
 
     emit!(RedeemEvent {
-        stablecoin_mint: stablecoin_mint.key(),
+        stablecoin_mint: ctx.accounts.stablecoin_mint.key(),
         user: ctx.accounts.user.key(),
         amount,
         fee_amount,
@@ -190,11 +213,10 @@ pub struct RedeemEvent {
 mod tests {
     use super::*;
 
-    // Tests remain the same as they don't directly interact with Switchboard
     #[test]
     fn test_fee_calculation() {
         let fee_basis_points = 30; // 0.3%
-        let amount = 1_000_000;
+        let amount: u64 = 1_000_000;
         
         let fee = amount
             .checked_mul(fee_basis_points as u64)

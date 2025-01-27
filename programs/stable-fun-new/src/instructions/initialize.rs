@@ -1,8 +1,8 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{Mint, Token, TokenAccount};
+use anchor_spl::token::{self, Token, TokenAccount};
 use switchboard_solana::AggregatorAccountData;
 
-use crate::state::{StablecoinMint, StablecoinVault, StateAccount};
+use crate::state::{StablecoinMint, StablecoinVault, StateAccount};  // Added StateAccount
 use crate::state::stablecoin::{StablecoinSettings, StablecoinStats};
 use crate::error::StableFunError;
 
@@ -42,9 +42,9 @@ pub struct Initialize<'info> {
         init,
         payer = authority,
         mint::decimals = 6,
-        mint::authority = mint_authority.key(),
+        mint::authority = mint_authority,
     )]
-    pub token_mint: Account<'info, Mint>,
+    pub token_mint: Box<Account<'info, token::Mint>>,
 
     #[account(
         seeds = [
@@ -56,7 +56,8 @@ pub struct Initialize<'info> {
     /// CHECK: PDA used as mint authority
     pub mint_authority: UncheckedAccount<'info>,
 
-    pub stablebond_mint: Account<'info, Mint>,
+    #[account(mut)]
+    pub stablebond_mint: Box<Account<'info, token::Mint>>,
 
     #[account(
         init,
@@ -76,7 +77,7 @@ pub struct Initialize<'info> {
         token::mint = stablebond_mint,
         token::authority = vault,
     )]
-    pub vault_token_account: Account<'info, TokenAccount>,
+    pub vault_token_account: Box<Account<'info, TokenAccount>>,
 
     /// Switchboard V3 aggregator account
     #[account(
@@ -95,7 +96,7 @@ pub fn handler(
     name: String,
     symbol: String,
     target_currency: String,
-    initial_supply: u64,
+    _initial_supply: u64,
 ) -> Result<()> {
     // Validate inputs
     require!(
@@ -169,25 +170,25 @@ pub fn handler(
         name,
         symbol,
         target_currency,
+        timestamp: clock.unix_timestamp,
     });
 
     Ok(())
 }
 
 #[event]
-#[derive(Clone, Debug)]
 pub struct StablecoinInitialized {
     pub stablecoin_mint: Pubkey,
     pub authority: Pubkey,
     pub name: String,
     pub symbol: String,
     pub target_currency: String,
+    pub timestamp: i64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anchor_lang::solana_program::system_program;
 
     #[test]
     fn test_validate_inputs() {
@@ -208,5 +209,21 @@ mod tests {
         assert!(short_name.len() < MIN_NAME_LENGTH);
         assert!(short_symbol.len() < MIN_SYMBOL_LENGTH);
         assert!(empty_currency.is_empty());
+    }
+
+    #[test]
+    fn test_default_settings() {
+        let settings = StablecoinSettings {
+            min_collateral_ratio: DEFAULT_COLLATERAL_RATIO,
+            fee_basis_points: 30,
+            max_supply: u64::MAX,
+            mint_paused: false,
+            redeem_paused: false,
+        };
+
+        assert_eq!(settings.min_collateral_ratio, 15000);
+        assert_eq!(settings.fee_basis_points, 30);
+        assert!(!settings.mint_paused);
+        assert!(!settings.redeem_paused);
     }
 }
